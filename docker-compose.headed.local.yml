@@ -1,0 +1,28 @@
+version: '3.8'
+
+# Compose riêng cho máy nhà (Ubuntu/WSL): Dockerfile.headed có sẵn
+# Playwright Chromium + Xvfb cho captcha personal mode, nhưng mapping
+# ra port 38000 vì port 8000 của máy đã bị app khác chiếm.
+# container_name giữ nguyên "flow2api" để không bao giờ chạy song song
+# 2 instance cùng ghi một DB.
+services:
+  flow2api:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile.headed
+    image: flow2api:headed
+    container_name: flow2api
+    ports:
+      - "38000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./tmp:/app/tmp
+      - ./config/setting.toml:/app/config/setting.toml
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ALLOW_DOCKER_HEADED_CAPTCHA=true
+      - DISPLAY=:99
+      - XVFB_SCREEN=1440x900x24
+    shm_size: "2gb"
+    restart: unless-stopped
