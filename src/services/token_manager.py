@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
@@ -1129,13 +1130,59 @@ class TokenManager:
         debug_logger.log_info(f"[COOKIE_REFRESH] Token {token_id}: Cookie 刷新并验证成功")
         return new_st
 
+    # Google 侧判定登录会话死亡的错误特征（protocol_login 的两条错误 +
+    # 旧版本写入 DB 的越南语变体）。与瞬时网络错误不重叠。
+    _DEAD_SESSION_MARKERS = (
+        "已失效",
+        "未返回已登录账号",
+        "vô hiệu hóa phiên đăng nhập",
+        "session has been invalidated",
+    )
+
+    def _is_dead_session_error(self, error: Optional[str]) -> bool:
+        """判断 Cookie 刷新失败是否意味着 Google 登录会话已死亡。"""
+        text = str(error or "").strip()
+        if not text or self._is_transient_network_failure(text):
+            # 瞬时网络错误优先排除，绝不能因此停用 token。
+            return False
+        lowered = text.lower()
+        return any(marker in lowered for marker in self._DEAD_SESSION_MARKERS)
+
+    async def _disable_dead_session_token(self, token: Token, error: str) -> None:
+        """Dead-session: 立即下线 token，避免负载均衡继续分发已死的 Cookie。"""
+        token_id = int(token.id)
+        try:
+            latest = await self.db.get_token(token_id)
+            if not latest or not latest.is_active:
+                return
+            await self.db.update_token(
+                token_id,
+                is_active=False,
+                ban_reason="dead_session",
+                banned_at=datetime.now(timezone.utc),
+            )
+            email = str(latest.email or latest.login_account or token_id)
+            # 告警挂钩：当前以醒目标记写入日志；如需 webhook/Telegram，
+            # 在此处补充推送即可（error 不含 Cookie 等敏感信息）。
+            debug_logger.log_error(
+                f"[TOKEN_AUTO_DISABLED] Token {token_id} ({email}): Google 登录会话已死亡 "
+                f"(dead session)，已自动停用，需要重新导入 Cookie。原因: {error}"
+            )
+        except Exception as exc:
+            debug_logger.log_error(
+                f"[TOKEN_AUTO_DISABLED] Token {token_id}: 自动停用失败 - {exc}"
+            )
+
     async def _record_cookie_refresh_failure(self, token: Token, error: str) -> None:
-        await self.db.update_token_if_cookie_matches(
+        saved = await self.db.update_token_if_cookie_matches(
             token.id, token.google_cookies,
             last_st_refresh_at=datetime.now(timezone.utc),
             last_st_refresh_result=error,
         )
         record_token_refresh("st", "failure")
+        # Cookie 已被插件/其他请求更新时，不基于旧 jar 的错误下结论。
+        if saved and self._is_dead_session_error(error):
+            await self._disable_dead_session_token(token, error)
 
     async def _try_protocol_refresh_st(
         self, token_id: int, token: Token
@@ -1235,6 +1282,9 @@ class TokenManager:
 
         tokens = await self.db.get_active_tokens()
         now = datetime.now(timezone.utc)
+        # 随机化顺序：每次 sweep 命中 Google 的 token 序列不同，避免固定模式。
+        random.shuffle(tokens)
+        refreshed_any = False
         for token in tokens:
             try:
                 if not token.auto_refresh_enabled:
@@ -1254,7 +1304,13 @@ class TokenManager:
                 ):
                     continue
 
+                # 错峰：同一 sweep 内相邻两次真实刷新间隔随机 5–30 秒，
+                # 消除多个 token 在同一秒内连续 GET /projects 的爆发模式。
+                if refreshed_any:
+                    await asyncio.sleep(random.uniform(5.0, 30.0))
+
                 await self._refresh_protocol_token(token, now)
+                refreshed_any = True
             except Exception as e:
                 debug_logger.log_error(
                     f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}"
