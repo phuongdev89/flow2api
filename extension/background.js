@@ -239,4 +239,80 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     }
 });
 
+// ============ Cookie push: đẩy cookie Google tươi từ Chrome nhà lên server ============
+// Chrome nhà là môi trường Google tin cậy nhất; server gặp cookie chết chỉ cần
+// chờ lần đẩy kế tiếp (mỗi 15 phút) là tự hồi phục.
+const COOKIE_PUSH_ALARM = "flow2api-cookie-push";
+
+function httpBaseFromServerUrl(wsUrl) {
+    try {
+        const url = new URL(wsUrl);
+        url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+        return url.origin;
+    } catch (e) {
+        return null;
+    }
+}
+
+function getAllGoogleCookies() {
+    return new Promise((resolve) => {
+        chrome.cookies.getAll({ domain: "google.com" }, (cookies) => {
+            if (chrome.runtime.lastError) {
+                console.log("[Flow2API] Cookie read error:", chrome.runtime.lastError.message);
+                resolve([]);
+                return;
+            }
+            resolve(cookies || []);
+        });
+    });
+}
+
+async function pushCookies(reason) {
+    const settings = await getSettings();
+    if (!settings.apiKey || !settings.serverUrl) return;
+    const base = httpBaseFromServerUrl(settings.serverUrl);
+    if (!base) return;
+    try {
+        const raw = await getAllGoogleCookies();
+        if (!raw.length) {
+            console.log("[Flow2API] No Google cookies in this profile, skip push.");
+            return;
+        }
+        const cookies = raw.map((c) => ({
+            domain: c.domain,
+            name: c.name,
+            value: c.value,
+            path: c.path,
+            secure: c.secure,
+            httpOnly: c.httpOnly,
+            hostOnly: c.hostOnly,
+            sameSite: c.sameSite,
+            expirationDate: c.expirationDate
+        }));
+        const resp = await fetch(base + "/api/tokens/cookie-push", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + settings.apiKey
+            },
+            body: JSON.stringify({
+                cookies: JSON.stringify(cookies),
+                client_label: settings.clientLabel || "chrome-extension",
+                reason: reason || "periodic"
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        console.log("[Flow2API] Cookie push (" + reason + "): HTTP", resp.status, data);
+    } catch (e) {
+        console.log("[Flow2API] Cookie push failed (" + reason + "):", e && e.message);
+    }
+}
+
+chrome.alarms.create(COOKIE_PUSH_ALARM, { delayInMinutes: 1, periodInMinutes: 15 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === COOKIE_PUSH_ALARM) pushCookies("alarm");
+});
+chrome.runtime.onStartup.addListener(() => pushCookies("startup"));
+pushCookies("installed");
+
 connectWS();

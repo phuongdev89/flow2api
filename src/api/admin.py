@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
-from ..core.auth import AuthManager
+from ..core.auth import AuthManager, verify_api_key_flexible
 from ..core.database import Database
 from ..core.config import (
     config,
@@ -1480,6 +1480,79 @@ async def import_tokens(
         "errors": errors if errors else None,
         "message": f"导入完成: 新增 {added} 个, 更新 {updated} 个"
         + (f", {len(errors)} 个失败" if errors else ""),
+    }
+
+
+class CookiePushRequest(BaseModel):
+    """Body cho extension đẩy cookie jar tươi từ Chrome nhà lên server."""
+
+    email: Optional[str] = None  # chỉ dùng để đối chiếu log; server tự nhận diện
+    cookies: str = Field(min_length=1)
+    client_label: Optional[str] = None
+
+
+@router.post("/api/tokens/cookie-push")
+async def cookie_push(
+    request: CookiePushRequest,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Nhận cookie jar từ extension (Chrome nhà), validate live rồi lưu.
+
+    Nguồn cookie chính là Chrome của chủ nhà — môi trường Google tin cậy.
+    Jar được validate bằng protocol RPC (curl), khi bị chặn thì fallback qua
+    browser thật; chỉ lưu khi jar còn sống. Token bị tự động ngưng vì
+    dead session sẽ được bật lại (self-healing)."""
+    cookies = str(request.cookies or "").strip()
+    if not cookies:
+        raise HTTPException(status_code=400, detail="cookies 不为空")
+
+    # 1) Live-validate jar + nhận diện tài khoản (curl, 失败时 browser fallback).
+    identity = await token_manager.detect_account_identity(cookies)
+    email = str(identity.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(
+            status_code=422, detail="无法从 Cookie 识别登录账号"
+        )
+
+    # 2) Xác định token đích theo email nhận diện được.
+    token = await db.get_token_by_email(email)
+    if token is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"没有账号为 {email} 的 Token，请先在后台导入该账号",
+        )
+    if request.email and str(request.email).strip().lower() not in {"", email}:
+        debug_logger.log_warning(
+            f"[COOKIE_PUSH] 推送声明的账号 {request.email} 与识别账号 {email} 不一致，以识别结果为准"
+        )
+
+    # 3) Lưu atomic qua đúng luồng refresh (validate + chống ghi đè jar mới hơn).
+    await token_manager._save_refreshed_cookies(
+        token.id,
+        token,
+        {
+            "google_cookies": identity.get("google_cookies") or cookies,
+            "email": email,
+            "session_token": str(identity.get("session_token") or ""),
+        },
+    )
+
+    # 4) Self-healing: token bị自动停 vì dead session (hoặc request-path disable
+    # không set ban_reason) sẽ được bật lại; token 429/admin ban 不受影响.
+    reenabled = False
+    if not token.is_active and (token.ban_reason or "") in ("", "dead_session"):
+        await token_manager.enable_token(token.id)
+        reenabled = True
+
+    debug_logger.log_info(
+        f"[COOKIE_PUSH] Token {token.id} ({email}): 已接收 Chrome 推送的最新 Cookie "
+        f"(reenabled={reenabled}, client={request.client_label or 'extension'})"
+    )
+    return {
+        "success": True,
+        "token_id": token.id,
+        "email": email,
+        "reenabled": reenabled,
     }
 
 
