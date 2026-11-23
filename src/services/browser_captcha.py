@@ -3044,7 +3044,27 @@ class TokenBrowser:
                 )
                 if urlparse(page.url).hostname != "flow.google.com" or not response or response.status != 200:
                     raise RuntimeError("Flow 登录已失效，请重新同步 Google Cookies")
-                email = await page.evaluate("(window.WIZ_global_data || {}).oPEP7c || ''")
+                # domcontentloaded 时 WIZ_global_data 可能尚未就绪，轮询等待
+                # 账号标识出现，避免把"页面还没加载完"误判成登录已失效。
+                email = ""
+                for _ in range(20):
+                    try:
+                        email = await page.evaluate(
+                            "(window.WIZ_global_data || {}).oPEP7c || ''"
+                        )
+                    except Exception:
+                        email = ""
+                    if str(email or "").strip():
+                        break
+                    await page.wait_for_timeout(500)
+                if not str(email or "").strip():
+                    # 兜底：直接在 HTML 里找 bootstrap 数据中的账号邮箱。
+                    try:
+                        from .protocol_login import extract_flow_account_email
+
+                        email = extract_flow_account_email(await page.content())
+                    except Exception:
+                        email = ""
                 cookies = [
                     cookie for cookie in await context.cookies()
                     if not is_partitioned_cookie(cookie) and (
@@ -3064,6 +3084,111 @@ class TokenBrowser:
                         pass
                 self._solve_inflight = max(0, self._solve_inflight - 1)
                 self.note_idle()
+
+    async def harvest_google_cookies_raw(
+        self, google_cookies: str, *, token_proxy_url: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Import 专用：把未入库的 Cookie jar 注入一次性上下文并导出刷新结果。
+
+        curl 客户端被 Google 风控 per-request 拦截时，protocol_login 会拿到
+        未登录页面壳导致 import 校验失败；真实浏览器通常仍能拿到已登录页面。
+        使用独立 context，不污染共享槽位的 token 绑定（注意：token_id=None
+        会触发共享槽按需重建，属可接受的偶发成本）。
+        """
+        if not str(google_cookies or "").strip():
+            raise ValueError("Cookie 数据为空，无法进行浏览器校验")
+        browser_cookies = self._build_google_cookie_targets(google_cookies)
+        if not browser_cookies:
+            raise ValueError("Cookie 数据无效，无法构造浏览器 Cookie")
+        _, browser, _ = await self._get_or_create_shared_browser(
+            token_proxy_url=token_proxy_url, token_id=None
+        )
+        context = await browser.new_context(viewport={"width": 1366, "height": 768}, locale="en-US")
+        page = None
+        try:
+            scoped_cookies = []
+            regular_cookies = []
+            for cookie in browser_cookies:
+                target = (
+                    scoped_cookies
+                    if cookie.get("url") and "path" in cookie
+                    else regular_cookies
+                )
+                target.append(cookie)
+            if regular_cookies:
+                await context.add_cookies(regular_cookies)
+            if scoped_cookies:
+                page = await context.new_page()
+                session = None
+                try:
+                    session = await context.new_cdp_session(page)
+                    await session.send("Network.setCookies", {"cookies": scoped_cookies})
+                finally:
+                    if session:
+                        try:
+                            await session.detach()
+                        except Exception:
+                            pass
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    page = None
+            page = await context.new_page()
+            response = await page.goto(
+                "https://flow.google.com/projects",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            if (
+                urlparse(page.url).hostname != "flow.google.com"
+                or not response
+                or response.status != 200
+            ):
+                raise RuntimeError("Flow 登录已失效，请重新同步 Google Cookies")
+            email = ""
+            for _ in range(20):
+                try:
+                    email = await page.evaluate(
+                        "(window.WIZ_global_data || {}).oPEP7c || ''"
+                    )
+                except Exception:
+                    email = ""
+                if str(email or "").strip():
+                    break
+                await page.wait_for_timeout(500)
+            if not str(email or "").strip():
+                try:
+                    from .protocol_login import extract_flow_account_email
+
+                    email = extract_flow_account_email(await page.content())
+                except Exception:
+                    email = ""
+            exported = [
+                cookie
+                for cookie in await context.cookies()
+                if not is_partitioned_cookie(cookie)
+                and (
+                    cookie["domain"].lstrip(".") == "google.com"
+                    or cookie["domain"].endswith(".google.com")
+                )
+            ]
+            return {
+                "google_cookies": json.dumps(
+                    exported, ensure_ascii=False, separators=(",", ":")
+                ),
+                "email": str(email or "").strip(),
+            }
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            try:
+                await context.close()
+            except Exception:
+                pass
 
     async def get_token(
         self,
