@@ -1026,9 +1026,27 @@ class TokenManager:
             cookies, proxy=normalized_proxy or None
         )
         if not result.get("success"):
-            raise ValueError(
-                str(result.get("error") or "无法从 Cookie 获取 Flow 登录邮箱")
-            )
+            protocol_error = str(result.get("error") or "无法从 Cookie 获取 Flow 登录邮箱")
+            # curl 被风控 per-request 拦截时，改用真实浏览器校验同一份 Cookie。
+            if config.captcha_method in {"personal", "browser"}:
+                try:
+                    from .browser_captcha import BrowserCaptchaService
+
+                    service = await BrowserCaptchaService.get_instance(self.db)
+                    result = await service.harvest_google_cookies_raw(
+                        cookies, token_proxy_url=normalized_proxy or None
+                    )
+                    debug_logger.log_info(
+                        "[PROTOCOL_LOGIN] Cookie 浏览器校验兜底成功"
+                        if result.get("success", True)
+                        else "[PROTOCOL_LOGIN] Cookie 浏览器校验兜底返回未成功"
+                    )
+                except Exception as browser_exc:
+                    raise ValueError(
+                        f"{protocol_error}（浏览器校验兜底也不可用: {browser_exc}）"
+                    )
+            else:
+                raise ValueError(protocol_error)
         email = str(result.get("email") or "").strip()
         if not email:
             raise ValueError("无法从 Cookie 获取 Flow 登录邮箱")
