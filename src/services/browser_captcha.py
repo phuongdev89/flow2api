@@ -4165,6 +4165,16 @@ class BrowserCaptchaService:
                 token_id=token_id, token_proxy_url=token_proxy_url
             )
 
+    async def harvest_google_cookies_raw(
+        self, google_cookies: str, *, token_proxy_url: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Delegate xuống TokenBrowser: import đẩy jar chưa入库 vào 1 slot bất kỳ."""
+        self._check_available()
+        async with self._borrow_browser() as request:
+            return await request.browser.harvest_google_cookies_raw(
+                google_cookies, token_proxy_url=token_proxy_url
+            )
+
     async def get_custom_token(
         self,
         website_url: str,
