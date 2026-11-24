@@ -125,7 +125,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # 启动服务
-python main.py
+python flow2api.py
 ```
 
 ### 首次访问

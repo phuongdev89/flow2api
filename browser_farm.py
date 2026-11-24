@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -45,9 +47,35 @@ sys.stdout.reconfigure(encoding="utf-8")
 ROOT = pathlib.Path(__file__).resolve().parent
 FARM_DIR = ROOT / "browser_farm"
 CONFIG_PATH = FARM_DIR / "farm_config.json"
-CHROME = "/usr/bin/google-chrome"
 PUSH_INTERVAL_MIN = 15
 START_URL = "https://flow.google.com/projects"
+
+
+def _detect_chrome() -> str:
+    """Tìm Chrome của hệ điều hành hiện tại (Linux hoặc Windows)."""
+    if os.name == "nt":
+        candidates = [
+            shutil.which("chrome"),
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        ]
+    else:
+        candidates = [
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            shutil.which("chromium"),
+            "/usr/bin/chromium",
+        ]
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+    return "chrome"
+
+
+CHROME = _detect_chrome()
 
 EXAMPLE_CONFIG = {
     "accounts": [
@@ -137,6 +165,12 @@ def start_chrome(acct: dict) -> str:
     return f"{email}: đã launch Chrome (port {port}, profile {profile.name})"
 
 
+_LOGIN_COOKIE_NAMES = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+}
+
+
 def push_cookies(base_url: str, key: str, acct: dict) -> str:
     email, port = acct["email"], int(acct["port"])
     if not cdp_alive(port):
@@ -157,8 +191,12 @@ def push_cookies(base_url: str, key: str, acct: dict) -> str:
             browser.close()
     except Exception as exc:
         return f"{email}: đọc cookie lỗi - {exc}"
-    if not cookies:
-        return f"{email}: chưa có cookie google nào (chưa đăng nhập?)"
+    names = {c["name"] for c in cookies}
+    if not names & _LOGIN_COOKIE_NAMES:
+        return (
+            f"{email}: CHƯA ĐĂNG NHẬP Google trong Chrome farm này "
+            f"(chỉ có {len(cookies)} cookie vô danh) — đăng nhập rồi chờ vòng sau"
+        )
 
     payload = json.dumps(
         {

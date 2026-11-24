@@ -1613,7 +1613,13 @@ async def cookie_push(request: Request):
         raise HTTPException(status_code=400, detail="cookies 不为空")
 
     # 1) Live-validate jar + nhận diện tài khoản (curl, 失败时 browser fallback).
-    identity = await token_manager.detect_account_identity(cookies)
+    #    detect raising (jar chưa đăng nhập / bị chặn) → 4xx sạch, không 500.
+    try:
+        identity = await token_manager.detect_account_identity(cookies)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"validate jar lỗi: {exc}")
     email = str(identity.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(
