@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import sys
 import json
+from pathlib import Path
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
 from fastapi.responses import JSONResponse
@@ -18,6 +19,7 @@ import urllib.request
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.logger import debug_logger
 from ..core.database import Database
 from ..core.config import (
     config,
@@ -1483,26 +1485,130 @@ async def import_tokens(
     }
 
 
-class CookiePushRequest(BaseModel):
-    """Body cho extension đẩy cookie jar tươi từ Chrome nhà lên server."""
+# ========== Cookie Push (extension đẩy jar Chrome nhà lên) ==========
 
-    email: Optional[str] = None  # chỉ dùng để đối chiếu log; server tự nhận diện
-    cookies: str = Field(min_length=1)
-    client_label: Optional[str] = None
+# File log raw: mọi request đẩy lên đều được ghi nguyên văn để debug.
+_COOKIE_PUSH_LOG_PATH = Path(__file__).resolve().parents[2] / "tmp" / "cookie-push.log"
+_COOKIE_PUSH_LOG_MAX_BODY = 2 * 1024 * 1024  # chặn flood ghi đĩa, 2MB là dư cho 1 jar
+
+
+def _append_cookie_push_log(text: str) -> None:
+    """Ghi raw vào tmp/cookie-push.log; lỗi log không được làm hỏng endpoint."""
+    try:
+        _COOKIE_PUSH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_COOKIE_PUSH_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write(text)
+    except Exception as e:  # pragma: no cover
+        try:
+            debug_logger.log_error(f"[COOKIE_PUSH] Không ghi được log raw: {e}")
+        except Exception:
+            pass
+
+
+async def _dump_cookie_push_request(request: Request) -> bytes:
+    """Đọc raw body + ghi nguyên văn toàn bộ request vào log, trả body về xử lý."""
+    body = await request.body()
+
+    client = request.client.host if request.client else "unknown"
+    lines = [
+        f"===== {datetime.now(timezone.utc).isoformat()} | "
+        f"{request.method} {request.url.path}"
+        f"{'?' + request.url.query if request.url.query else ''} | client={client} =====",
+    ]
+    for name, value in request.headers.items():
+        lines.append(f"{name}: {value}")
+    lines.append("")
+    if body:
+        try:
+            body_text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            body_text = body.decode("utf-8", errors="replace")
+            lines.append("[body: binary, best-effort decode]")
+        if len(body_text) > _COOKIE_PUSH_LOG_MAX_BODY:
+            lines.append(
+                body_text[:_COOKIE_PUSH_LOG_MAX_BODY]
+                + f"\n[... truncated, tổng {len(body_text)} chars]"
+            )
+        else:
+            lines.append(body_text)
+    else:
+        lines.append("[body: empty]")
+    lines.append("")
+    _append_cookie_push_log("\n".join(lines) + "\n")
+    return body
+
+
+def _cookie_push_api_key_from_request(request: Request) -> Optional[str]:
+    """Lấy API key từ Authorization Bearer / x-goog-api-key / ?key= (giống verify_api_key_flexible)."""
+    auth_header = request.headers.get("authorization") or ""
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    if request.headers.get("x-goog-api-key"):
+        return str(request.headers.get("x-goog-api-key")).strip()
+    if request.query_params.get("key"):
+        return str(request.query_params.get("key")).strip()
+    return None
+
+
+def _parse_cookie_push_payload(body: bytes) -> Dict[str, Any]:
+    """Parse mềm dẻo: JSON object/array, hoặc plain text jar — đón được thì lấy."""
+    raw = body.decode("utf-8", errors="replace").strip()
+    if not raw:
+        return {"cookies": "", "email": None, "client_label": None, "reason": None}
+
+    payload: Dict[str, Any] = {}
+    cookies_text = ""
+
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        data = None
+
+    if isinstance(data, dict):
+        payload = data
+        candidate = data.get("cookies", data.get("cookie_jar", data.get("jar", "")))
+        if isinstance(candidate, list):
+            # Mảng cookie object (extension đẩy JSON-string của array) → jar string
+            cookies_text = "; ".join(
+                f"{c.get('name')}={c.get('value')}"
+                for c in candidate
+                if isinstance(c, dict) and c.get("name")
+            )
+        elif candidate is not None:
+            cookies_text = str(candidate)
+    elif isinstance(data, list):
+        cookies_text = "; ".join(
+            f"{c.get('name')}={c.get('value')}"
+            for c in data
+            if isinstance(c, dict) and c.get("name")
+        )
+    else:
+        # Plain text: coi toàn bộ body là cookie jar
+        cookies_text = raw
+
+    return {
+        "cookies": cookies_text.strip(),
+        "email": payload.get("email"),
+        "client_label": payload.get("client_label"),
+        "reason": payload.get("reason"),
+    }
 
 
 @router.post("/api/tokens/cookie-push")
-async def cookie_push(
-    request: CookiePushRequest,
-    api_key: str = Depends(verify_api_key_flexible),
-):
+async def cookie_push(request: Request):
     """Nhận cookie jar từ extension (Chrome nhà), validate live rồi lưu.
 
-    Nguồn cookie chính là Chrome của chủ nhà — môi trường Google tin cậy.
-    Jar được validate bằng protocol RPC (curl), khi bị chặn thì fallback qua
-    browser thật; chỉ lưu khi jar còn sống. Token bị tự động ngưng vì
-    dead session sẽ được bật lại (self-healing)."""
-    cookies = str(request.cookies or "").strip()
+    Mọi request (kể cả sai key, sai format) đều được ghi nguyên văn vào
+    tmp/cookie-push.log trước khi xử lý — phục vụ debug luồng đẩy cookie."""
+    body = await _dump_cookie_push_request(request)
+
+    # 0) Auth thủ công (sau khi đã log) — Bearer / x-goog-api-key / ?key=.
+    api_key = _cookie_push_api_key_from_request(request)
+    if not api_key or not AuthManager.verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    parsed = _parse_cookie_push_payload(body)
+    cookies = parsed["cookies"]
     if not cookies:
         raise HTTPException(status_code=400, detail="cookies 不为空")
 
@@ -1521,9 +1627,9 @@ async def cookie_push(
             status_code=404,
             detail=f"没有账号为 {email} 的 Token，请先在后台导入该账号",
         )
-    if request.email and str(request.email).strip().lower() not in {"", email}:
+    if parsed.get("email") and str(parsed["email"]).strip().lower() not in {"", email}:
         debug_logger.log_warning(
-            f"[COOKIE_PUSH] 推送声明的账号 {request.email} 与识别账号 {email} 不一致，以识别结果为准"
+            f"[COOKIE_PUSH] 推送声明的账号 {parsed['email']} 与识别账号 {email} 不一致，以识别结果为准"
         )
 
     # 3) Lưu atomic qua đúng luồng refresh (validate + chống ghi đè jar mới hơn).
@@ -1544,9 +1650,13 @@ async def cookie_push(
         await token_manager.enable_token(token.id)
         reenabled = True
 
+    _append_cookie_push_log(
+        f"----- KẾT QUẢ: token_id={token.id} email={email} reenabled={reenabled} "
+        f"client={parsed.get('client_label') or 'extension'} reason={parsed.get('reason') or '-'} -----\n\n"
+    )
     debug_logger.log_info(
         f"[COOKIE_PUSH] Token {token.id} ({email}): 已接收 Chrome 推送的最新 Cookie "
-        f"(reenabled={reenabled}, client={request.client_label or 'extension'})"
+        f"(reenabled={reenabled}, client={parsed.get('client_label') or 'extension'})"
     )
     return {
         "success": True,
